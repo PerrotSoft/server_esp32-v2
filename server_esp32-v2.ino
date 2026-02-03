@@ -7,9 +7,7 @@
 
 struct WiFiNet { String ssid; String pass; };
 WiFiNet myNets[10] = {
-  {"TP-Link_zhenja_4G", "5840902a"},
-  {"TP-Link_BA1C", "t19610313"},
-  {"Redmi Note 12", "123321123321"}
+
 };
 int netsCount = 3;
 
@@ -174,28 +172,65 @@ void setup() {
   initSD();
   initCooling();
 
+  // 1. Сначала задаем режим работы (Точка доступа + Клиент)
   WiFi.mode(WIFI_AP_STA);
   
-  // Настройка точки доступа (AP)
+  // 2. СРАЗУ поднимаем точку доступа, чтобы она была доступна независимо от успеха STA
   WiFi.softAP("ESP32_SYSTEM", "12345678");
+  delay(100); // Короткая пауза для стабилизации стека
 
+  // 3. Пытаемся подключиться к известным сетям
   bool connected = false;
+  Serial.println("\nConnecting to WiFi STA...");
+  
   for (int i = 0; i < netsCount; i++) {
+    Serial.printf("Trying: %s ", myNets[i].ssid.c_str());
     WiFi.begin(myNets[i].ssid.c_str(), myNets[i].pass.c_str());
+    
     unsigned long start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) delay(500);
-    if (WiFi.status() == WL_CONNECTED) { connected = true; break; }
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
+      delay(500);
+      Serial.print(".");
+    }
+
+    if (WiFi.status() == WL_CONNECTED) { 
+      connected = true; 
+      Serial.println(" OK!");
+      break; 
+    } else {
+      WiFi.disconnect(); // Важно: сбрасываем попытку перед следующим циклом
+      delay(100);
+      Serial.println(" Fail");
+    }
   }
 
+  // 4. Если авто-подключение не вышло, запрашиваем через Serial
   if (!connected) {
-    Serial.println("WiFi STA Connection Failed.");
+    Serial.println("All pre-configured networks failed.");
+    Serial.println("Enter SSID via Serial (or leave empty to skip):");
+    
+    // Ожидание ввода с таймаутом, чтобы не зависнуть навсегда
+    unsigned long waitStart = millis();
+    while(!Serial.available() && millis() - waitStart < 15000) delay(10);
+    
+    if (Serial.available()) {
+      String s = Serial.readStringUntil('\n'); s.trim();
+      if (s.length() > 0) {
+        Serial.println("Enter PASS:");
+        while(!Serial.available()); 
+        String p = Serial.readStringUntil('\n'); p.trim();
+        WiFi.begin(s.c_str(), p.c_str());
+      }
+    }
   }
 
-  Serial.println("\n--- ИНФОРМАЦИЯ О ПОДКЛЮЧЕНИИ ---");
-  Serial.printf("1. Локальная сеть (STA): http://%s/\n", WiFi.localIP().toString().c_str());
-  Serial.printf("2. Прямая точка (AP): http://%s/ (SSID: ESP32_SYSTEM)\n", WiFi.softAPIP().toString().c_str());
-  Serial.println("--------------------------------\n");
+  // Вывод итоговой информации в консоль
+  Serial.println("\n--- СЕТЕВАЯ КОНФИГУРАЦИЯ ---");
+  Serial.printf("Локальный IP (STA): http://%s/\n", WiFi.localIP().toString().c_str());
+  Serial.printf("Точка доступа (AP): http://%s/ (SSID: ESP32_SYSTEM)\n", WiFi.softAPIP().toString().c_str());
+  Serial.println("----------------------------\n");
 
+  // --- Регистрация обработчиков сервера ---
   server.on("/", []() { if (!handleFileRead("/")) handleFilesPage(); });
   server.on("/files_page", handleFilesPage);
   
@@ -236,13 +271,11 @@ void setup() {
   server.on("/sys_page", []() {
     String s = getNav(3) + "<div class='content'><h1>" + msg("Статус Системы", "System Status") + "</h1>";
     
-    // БЛОК С АДРЕСАМИ
-    s += "<div class='card'><h3>🌐 " + msg("Сетевые адреса", "Network Addresses") + "</h3>";
-    s += "<p>" + msg("Прямое подключение (AP): ", "Direct Access (AP): ") + "<b class='ip-info'>http://" + WiFi.softAPIP().toString() + "/</b></p>";
+    // Блок с IP-адресами в вебе
+    s += "<div class='card'><h3>🌐 " + msg("Сеть", "Network") + "</h3>";
+    s += "<p><b>IP Точки доступа:</b> http://" + WiFi.softAPIP().toString() + "/</p>";
     if(WiFi.status() == WL_CONNECTED) {
-       s += "<p>" + msg("Локальная сеть (STA): ", "Local Network (STA): ") + "<b class='ip-info'>http://" + WiFi.localIP().toString() + "/</b></p>";
-    } else {
-       s += "<p style='color:red'>" + msg("STA не подключен", "STA Disconnected") + "</p>";
+       s += "<p><b>IP в вашей сети:</b> http://" + WiFi.localIP().toString() + "/</p>";
     }
     s += "</div>";
 
