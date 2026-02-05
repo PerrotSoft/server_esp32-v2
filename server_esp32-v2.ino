@@ -7,12 +7,15 @@
 
 struct WiFiNet { String ssid; String pass; };
 WiFiNet myNets[10] = {
-
+  {"TP-Link_zhenja_4G", "5840902a"},
+  {"TP-Link_BA1C", "t19610313"},
+  {"Redmi Note 12", "123321123321"}
 };
 int netsCount = 3;
 
 WebServer server(80);
 File uploadFile;
+DynamicJsonDocument globalDB(8192); // БАЗА ДАННЫХ JSON
 bool isEN = false; 
 bool sdStarted = false;
 String currentPath = "/";
@@ -38,12 +41,26 @@ String formatSize(uint64_t bytes) {
 
 void initSD() {
   SPI.begin(pin_SCK, pin_MISO, pin_MOSI, pin_CS);
-  if (SD.begin(pin_CS)) {
-    sdStarted = true;
-    Serial.println("SD Card: OK");
-  } else {
-    sdStarted = false;
-    Serial.println("SD Card: NOT FOUND");
+  if (SD.begin(pin_CS)) { sdStarted = true; Serial.println("SD Card: OK"); } 
+  else { sdStarted = false; Serial.println("SD Card: NOT FOUND"); }
+}
+
+// === ФУНКЦИИ БАЗЫ ДАННЫХ ===
+void saveDB() {
+  if (xSemaphoreTake(fsMutex, portMAX_DELAY)) {
+    File f = LittleFS.open("/db.json", "w");
+    if (f) { serializeJson(globalDB, f); f.close(); }
+    xSemaphoreGive(fsMutex);
+  }
+}
+
+void loadDB() {
+  if (LittleFS.exists("/db.json")) {
+    if (xSemaphoreTake(fsMutex, portMAX_DELAY)) {
+      File f = LittleFS.open("/db.json", "r");
+      if (f) { deserializeJson(globalDB, f); f.close(); }
+      xSemaphoreGive(fsMutex);
+    }
   }
 }
 
@@ -170,79 +187,94 @@ void setup() {
   fsMutex = xSemaphoreCreateMutex();
   LittleFS.begin(true);
   initSD();
+  loadDB(); // ЗАГРУЗКА БД ПРИ СТАРТЕ
   initCooling();
 
-  // 1. Сначала задаем режим работы (Точка доступа + Клиент)
   WiFi.mode(WIFI_AP_STA);
-  
-  // 2. СРАЗУ поднимаем точку доступа, чтобы она была доступна независимо от успеха STA
   WiFi.softAP("ESP32_SYSTEM", "12345678");
-  delay(100); // Короткая пауза для стабилизации стека
+  delay(100); 
 
-  // 3. Пытаемся подключиться к известным сетям
   bool connected = false;
   Serial.println("\nConnecting to WiFi STA...");
   
   for (int i = 0; i < netsCount; i++) {
     Serial.printf("Trying: %s ", myNets[i].ssid.c_str());
     WiFi.begin(myNets[i].ssid.c_str(), myNets[i].pass.c_str());
-    
     unsigned long start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
-      delay(500);
-      Serial.print(".");
-    }
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) { delay(500); Serial.print("."); }
 
     if (WiFi.status() == WL_CONNECTED) { 
-      connected = true; 
-      Serial.println(" OK!");
-      break; 
+      connected = true; Serial.println(" OK!"); break; 
     } else {
-      WiFi.disconnect(); // Важно: сбрасываем попытку перед следующим циклом
-      delay(100);
-      Serial.println(" Fail");
+      WiFi.disconnect(); delay(100); Serial.println(" Fail");
     }
   }
 
-  // 4. Если авто-подключение не вышло, запрашиваем через Serial
   if (!connected) {
-    Serial.println("All pre-configured networks failed.");
-    Serial.println("Enter SSID via Serial (or leave empty to skip):");
-    
-    // Ожидание ввода с таймаутом, чтобы не зависнуть навсегда
+    Serial.println("AP Mode Only. Enter SSID/PASS via Serial to connect.");
     unsigned long waitStart = millis();
     while(!Serial.available() && millis() - waitStart < 15000) delay(10);
-    
     if (Serial.available()) {
       String s = Serial.readStringUntil('\n'); s.trim();
       if (s.length() > 0) {
-        Serial.println("Enter PASS:");
-        while(!Serial.available()); 
+        Serial.println("Enter PASS:"); while(!Serial.available()); 
         String p = Serial.readStringUntil('\n'); p.trim();
         WiFi.begin(s.c_str(), p.c_str());
       }
     }
   }
 
-  // Вывод итоговой информации в консоль
-  Serial.println("\n--- СЕТЕВАЯ КОНФИГУРАЦИЯ ---");
-  Serial.printf("Локальный IP (STA): http://%s/\n", WiFi.localIP().toString().c_str());
-  Serial.printf("Точка доступа (AP): http://%s/ (SSID: ESP32_SYSTEM)\n", WiFi.softAPIP().toString().c_str());
-  Serial.println("----------------------------\n");
+  Serial.printf("IP: http://%s/\nAP: http://%s/\n", WiFi.localIP().toString().c_str(), WiFi.softAPIP().toString().c_str());
 
-  // --- Регистрация обработчиков сервера ---
+  // === API DB (set, get, del) ===
+  server.on("/api/db", []() {
+    String cmd = server.arg("cmd");
+    String k = server.arg("k");
+    if (cmd == "set") { globalDB[k] = server.arg("v"); saveDB(); server.send(200, "text/plain", "OK"); }
+    else if (cmd == "get") { String r; serializeJson(globalDB[k], r); server.send(200, "text/plain", r); }
+    else if (cmd == "del") { globalDB.remove(k); saveDB(); server.send(200, "text/plain", "OK"); }
+    else server.send(400, "text/plain", "Bad Request");
+  });
+
+  // === API FILES (fread, fwrite, fcreate, fdel) ===
+  server.on("/api/files", []() {
+    String cmd = server.arg("cmd");
+    String path = server.arg("path");
+    bool isSD = path.startsWith("/sd/");
+    String p = isSD ? path.substring(3) : path;
+    
+    if (xSemaphoreTake(fsMutex, portMAX_DELAY)) {
+      // 1. ЧТЕНИЕ
+      if (cmd == "fread") {
+        File f = isSD ? SD.open(p, "r") : LittleFS.open(p, "r");
+        if (f) { server.streamFile(f, "text/plain"); f.close(); }
+        else server.send(404, "text/plain", "Not Found");
+      }
+      // 2. ЗАПИСЬ / СОЗДАНИЕ
+      else if (cmd == "fwrite" || cmd == "fcreate") {
+        File f = isSD ? SD.open(p, "w") : LittleFS.open(p, "w");
+        if (f) { f.print(server.arg("v")); f.close(); server.send(200, "text/plain", "OK"); }
+        else server.send(500, "text/plain", "Err");
+      }
+      // 3. УДАЛЕНИЕ
+      else if (cmd == "fdel") {
+        bool ok = isSD ? SD.remove(p) : LittleFS.remove(p);
+        server.send(200, "text/plain", ok ? "OK" : "Err");
+      }
+      xSemaphoreGive(fsMutex);
+    }
+  });
+
   server.on("/", []() { if (!handleFileRead("/")) handleFilesPage(); });
   server.on("/files_page", handleFilesPage);
   
   server.on("/mkdir", []() {
     String p = server.arg("p") + server.arg("n");
     if (xSemaphoreTake(fsMutex, portMAX_DELAY)) {
-      if (p.startsWith("/sd/")) SD.mkdir(p.substring(3));
-      else LittleFS.mkdir(p);
+      if (p.startsWith("/sd/")) SD.mkdir(p.substring(3)); else LittleFS.mkdir(p);
       xSemaphoreGive(fsMutex);
     }
-    server.sendHeader("Location", "/files_page?path=" + server.arg("p"));
-    server.send(303);
+    server.sendHeader("Location", "/files_page?path=" + server.arg("p")); server.send(303);
   });
 
   server.on("/upload", HTTP_POST, [](){ server.send(200); }, [](){
@@ -264,29 +296,20 @@ void setup() {
       else { if(!LittleFS.remove(f)) LittleFS.rmdir(f); }
       xSemaphoreGive(fsMutex);
     }
-    server.sendHeader("Location", "/files_page?path=" + currentPath);
-    server.send(303);
+    server.sendHeader("Location", "/files_page?path=" + currentPath); server.send(303);
   });
 
   server.on("/sys_page", []() {
     String s = getNav(3) + "<div class='content'><h1>" + msg("Статус Системы", "System Status") + "</h1>";
-    
-    // Блок с IP-адресами в вебе
     s += "<div class='card'><h3>🌐 " + msg("Сеть", "Network") + "</h3>";
     s += "<p><b>IP Точки доступа:</b> http://" + WiFi.softAPIP().toString() + "/</p>";
-    if(WiFi.status() == WL_CONNECTED) {
-       s += "<p><b>IP в вашей сети:</b> http://" + WiFi.localIP().toString() + "/</p>";
-    }
-    s += "</div>";
-
-    s += "<div class='card'><h3>🌡️ CPU: " + String(temperatureRead(), 1) + "°C</h3></div>";
+    if(WiFi.status() == WL_CONNECTED) s += "<p><b>IP в вашей сети:</b> http://" + WiFi.localIP().toString() + "/</p>";
+    s += "</div><div class='card'><h3>🌡️ CPU: " + String(temperatureRead(), 1) + "°C</h3></div>";
     s += "<div class='card'><h3>💾 LittleFS (Flash)</h3><p>Used: " + formatSize(LittleFS.usedBytes()) + " / " + formatSize(LittleFS.totalBytes()) + "</p></div>";
     if (sdStarted) {
-      s += "<div class='card'><h3>💾 MicroSD Card</h3><p>Size: " + formatSize(SD.cardSize()) + "</p>";
-      s += "<p>Type: " + String(SD.cardType() == CARD_SDHC ? "SDHC" : "SD") + "</p></div>";
+      s += "<div class='card'><h3>💾 MicroSD Card</h3><p>Size: " + formatSize(SD.cardSize()) + "</p><p>Type: " + String(SD.cardType() == CARD_SDHC ? "SDHC" : "SD") + "</p></div>";
     }
-    s += "<div class='card'><h3>🔗 WiFi Networks</h3>";
-    s += "<form action='/add_wifi' method='POST'>";
+    s += "<div class='card'><h3>🔗 WiFi Networks</h3><form action='/add_wifi' method='POST'>";
     s += "<input name='s' placeholder='SSID'> <input name='p' placeholder='PASS'> <button type='submit'>Add</button></form><hr>";
     for(int i=0; i<netsCount; i++) s += "<div>• " + myNets[i].ssid + "</div>";
     s += "</div><button class='red' onclick=\"location.href='/restart'\">RESTART</button></div>";
